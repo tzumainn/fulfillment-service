@@ -24,6 +24,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	clnt "sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -41,6 +43,12 @@ import (
 // objectPrefix is the prefix that will be used in the `generateName` field of the resources created in the hub.
 const objectPrefix = "vm-"
 
+// userDataSecretSuffix is appended to the compute instance ID to form the user data Secret name.
+const userDataSecretSuffix = "-user-data"
+
+// userDataSecretKey is the key used in the Secret's stringData to store the cloud-init user data.
+const userDataSecretKey = "userdata"
+
 // FunctionBuilder contains the data and logic needed to build a function that reconciles compute instances.
 type FunctionBuilder struct {
 	logger     *slog.Logger
@@ -57,11 +65,12 @@ type function struct {
 }
 
 type task struct {
-	r               *function
-	computeInstance *privatev1.ComputeInstance
-	hubId           string
-	hubNamespace    string
-	hubClient       clnt.Client
+	r                  *function
+	computeInstance    *privatev1.ComputeInstance
+	hubId              string
+	hubNamespace       string
+	hubClient          clnt.Client
+	userDataSecretName string
 }
 
 // NewFunction creates a new builder that can then be used to create a new compute instance reconciler function.
@@ -172,6 +181,11 @@ func (t *task) update(ctx context.Context) error {
 		return err
 	}
 
+	// Set the user data Secret name if user data is provided (no K8s call yet):
+	if t.computeInstance.GetSpec().HasUserDataSecretRef() {
+		t.userDataSecretName = fmt.Sprintf("%s%s", t.computeInstance.GetId(), userDataSecretSuffix)
+	}
+
 	// Prepare the changes to the spec:
 	spec, err := t.buildSpec()
 	if err != nil {
@@ -180,7 +194,7 @@ func (t *task) update(ctx context.Context) error {
 
 	// Create or update the Kubernetes object:
 	if object == nil {
-		object := &unstructured.Unstructured{}
+		object = &unstructured.Unstructured{}
 		object.SetGroupVersionKind(gvks.ComputeInstance)
 		object.SetNamespace(t.hubNamespace)
 		object.SetGenerateName(objectPrefix)
@@ -222,7 +236,12 @@ func (t *task) update(ctx context.Context) error {
 		)
 	}
 
-	return err
+	// Create the user data Secret with owner reference to the CR (immutable, created once):
+	if err := t.ensureUserDataSecret(ctx, object); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (t *task) setDefaults() {
@@ -454,5 +473,104 @@ func (t *task) buildSpec() (map[string]any, error) {
 		spec["restartRequestedAt"] = t.computeInstance.GetSpec().GetRestartRequestedAt().AsTime().Format(time.RFC3339)
 	}
 
+	// Add explicit spec fields if present:
+	t.addExplicitFields(spec)
+
 	return spec, nil
+}
+
+func (t *task) addExplicitFields(spec map[string]any) {
+	ciSpec := t.computeInstance.GetSpec()
+
+	if ciSpec.HasCores() {
+		spec["cores"] = int64(ciSpec.GetCores())
+	}
+	if ciSpec.HasMemoryGib() {
+		spec["memoryGiB"] = int64(ciSpec.GetMemoryGib())
+	}
+	if ciSpec.HasRunStrategy() {
+		spec["runStrategy"] = ciSpec.GetRunStrategy()
+	}
+	if ciSpec.HasSshKey() {
+		spec["sshKey"] = ciSpec.GetSshKey()
+	}
+	if t.userDataSecretName != "" {
+		spec["userDataSecretRef"] = map[string]any{
+			"name": t.userDataSecretName,
+		}
+	}
+	if ciSpec.HasImage() {
+		spec["image"] = map[string]any{
+			"sourceType": ciSpec.GetImage().GetSourceType(),
+			"sourceRef":  ciSpec.GetImage().GetSourceRef(),
+		}
+	}
+	if ciSpec.HasBootDisk() {
+		bootDisk := map[string]any{
+			"sizeGiB": int64(ciSpec.GetBootDisk().GetSizeGib()),
+		}
+		if ciSpec.GetBootDisk().HasStorageClass() {
+			bootDisk["storageClass"] = ciSpec.GetBootDisk().GetStorageClass()
+		}
+		spec["bootDisk"] = bootDisk
+	}
+	if len(ciSpec.GetAdditionalDisks()) > 0 {
+		disks := make([]any, 0, len(ciSpec.GetAdditionalDisks()))
+		for _, disk := range ciSpec.GetAdditionalDisks() {
+			d := map[string]any{
+				"sizeGiB": int64(disk.GetSizeGib()),
+			}
+			if disk.HasStorageClass() {
+				d["storageClass"] = disk.GetStorageClass()
+			}
+			disks = append(disks, d)
+		}
+		spec["additionalDisks"] = disks
+	}
+}
+
+// ensureUserDataSecret creates a Kubernetes Secret containing the cloud-init user data
+// provided via the fulfillment API. The Secret is owned by the ComputeInstance CR so that
+// Kubernetes garbage collection handles cleanup automatically on deletion.
+// The user data field is immutable, so the Secret is only created once.
+func (t *task) ensureUserDataSecret(ctx context.Context, owner *unstructured.Unstructured) error {
+	if t.userDataSecretName == "" {
+		return nil
+	}
+
+	secret := &unstructured.Unstructured{}
+	secret.SetGroupVersionKind(gvks.Secret)
+	secret.SetNamespace(t.hubNamespace)
+	secret.SetName(t.userDataSecretName)
+	secret.SetLabels(map[string]string{
+		labels.ComputeInstanceUuid: t.computeInstance.GetId(),
+	})
+	secret.SetOwnerReferences([]metav1.OwnerReference{
+		{
+			APIVersion: gvks.ComputeInstance.GroupVersion().String(),
+			Kind:       gvks.ComputeInstance.Kind,
+			Name:       owner.GetName(),
+			UID:        owner.GetUID(),
+		},
+	})
+	if err := unstructured.SetNestedField(secret.Object, map[string]any{
+		userDataSecretKey: t.computeInstance.GetSpec().GetUserDataSecretRef(),
+	}, "stringData"); err != nil {
+		return err
+	}
+
+	err := t.hubClient.Create(ctx, secret)
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	t.r.logger.DebugContext(
+		ctx,
+		"Created user data secret",
+		slog.String("namespace", secret.GetNamespace()),
+		slog.String("name", secret.GetName()),
+	)
+	return nil
 }

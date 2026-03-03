@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -73,6 +74,92 @@ var _ = Describe("buildSpec", func() {
 			// Verify other required fields are present
 			Expect(spec["templateID"]).To(Equal(template))
 			Expect(spec["templateParameters"]).ToNot(BeNil())
+		})
+
+		It("Includes explicit fields in spec map when present", func() {
+			template := "osac.templates.ocp_virt_vm"
+			task := &task{
+				computeInstance: privatev1.ComputeInstance_builder{
+					Id: "test-explicit-fields",
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						Template:    template,
+						Cores:       proto.Int32(4),
+						MemoryGib:   proto.Int32(8),
+						RunStrategy: proto.String("Always"),
+						SshKey:      proto.String("ssh-rsa AAAA..."),
+						Image: privatev1.ComputeInstanceImage_builder{
+							SourceType: "registry",
+							SourceRef:  "quay.io/fedora/fedora:latest",
+						}.Build(),
+						BootDisk: privatev1.ComputeInstanceDisk_builder{
+							SizeGib:      20,
+							StorageClass: proto.String("fast"),
+						}.Build(),
+						AdditionalDisks: []*privatev1.ComputeInstanceDisk{
+							privatev1.ComputeInstanceDisk_builder{
+								SizeGib: 100,
+							}.Build(),
+							privatev1.ComputeInstanceDisk_builder{
+								SizeGib:      50,
+								StorageClass: proto.String("slow"),
+							}.Build(),
+						},
+					}.Build(),
+				}.Build(),
+				userDataSecretName: "test-explicit-fields-user-data",
+			}
+
+			spec, err := task.buildSpec()
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(spec["cores"]).To(Equal(int64(4)))
+			Expect(spec["memoryGiB"]).To(Equal(int64(8)))
+			Expect(spec["runStrategy"]).To(Equal("Always"))
+			Expect(spec["sshKey"]).To(Equal("ssh-rsa AAAA..."))
+
+			image := spec["image"].(map[string]any)
+			Expect(image["sourceType"]).To(Equal("registry"))
+			Expect(image["sourceRef"]).To(Equal("quay.io/fedora/fedora:latest"))
+
+			bootDisk := spec["bootDisk"].(map[string]any)
+			Expect(bootDisk["sizeGiB"]).To(Equal(int64(20)))
+			Expect(bootDisk["storageClass"]).To(Equal("fast"))
+
+			additionalDisks := spec["additionalDisks"].([]any)
+			Expect(additionalDisks).To(HaveLen(2))
+			disk0 := additionalDisks[0].(map[string]any)
+			Expect(disk0["sizeGiB"]).To(Equal(int64(100)))
+			Expect(disk0).ToNot(HaveKey("storageClass"))
+			disk1 := additionalDisks[1].(map[string]any)
+			Expect(disk1["sizeGiB"]).To(Equal(int64(50)))
+			Expect(disk1["storageClass"]).To(Equal("slow"))
+
+			userDataRef := spec["userDataSecretRef"].(map[string]any)
+			Expect(userDataRef["name"]).To(Equal("test-explicit-fields-user-data"))
+		})
+
+		It("Excludes explicit fields from spec map when not set", func() {
+			template := "osac.templates.ocp_virt_vm"
+			task := &task{
+				computeInstance: privatev1.ComputeInstance_builder{
+					Id: "test-no-explicit-fields",
+					Spec: privatev1.ComputeInstanceSpec_builder{
+						Template: template,
+					}.Build(),
+				}.Build(),
+			}
+
+			spec, err := task.buildSpec()
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(spec).ToNot(HaveKey("cores"))
+			Expect(spec).ToNot(HaveKey("memoryGiB"))
+			Expect(spec).ToNot(HaveKey("runStrategy"))
+			Expect(spec).ToNot(HaveKey("sshKey"))
+			Expect(spec).ToNot(HaveKey("image"))
+			Expect(spec).ToNot(HaveKey("bootDisk"))
+			Expect(spec).ToNot(HaveKey("additionalDisks"))
+			Expect(spec).ToNot(HaveKey("userDataSecretRef"))
 		})
 
 		It("Excludes restartRequestedAt from spec map when not set", func() {
@@ -309,5 +396,148 @@ var _ = Describe("delete", func() {
 		err := t.delete(ctx)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(hasFinalizer(t.computeInstance)).To(BeFalse())
+	})
+})
+
+var _ = Describe("ensureUserDataSecret", func() {
+	const (
+		ciID         = "test-ci-user-data"
+		hubNamespace = "test-ns"
+		crName       = "vm-test"
+		crUID        = "test-uid-123"
+	)
+
+	var (
+		ctx   context.Context
+		owner *unstructured.Unstructured
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		owner = &unstructured.Unstructured{}
+		owner.SetGroupVersionKind(gvks.ComputeInstance)
+		owner.SetNamespace(hubNamespace)
+		owner.SetName(crName)
+		owner.SetUID(crUID)
+	})
+
+	It("should create a Secret with owner reference, labels, and content", func() {
+		scheme := runtime.NewScheme()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+
+		t := &task{
+			r: &function{logger: logger},
+			computeInstance: privatev1.ComputeInstance_builder{
+				Id: ciID,
+				Spec: privatev1.ComputeInstanceSpec_builder{
+					UserDataSecretRef: proto.String("#cloud-config\npackages:\n  - vim"),
+				}.Build(),
+			}.Build(),
+			hubNamespace:       hubNamespace,
+			hubClient:          fakeClient,
+			userDataSecretName: ciID + userDataSecretSuffix,
+		}
+
+		err := t.ensureUserDataSecret(ctx, owner)
+		Expect(err).ToNot(HaveOccurred())
+
+		secret := &unstructured.Unstructured{}
+		secret.SetGroupVersionKind(gvks.Secret)
+		err = fakeClient.Get(ctx, clnt.ObjectKey{
+			Namespace: hubNamespace,
+			Name:      ciID + userDataSecretSuffix,
+		}, secret)
+		Expect(err).ToNot(HaveOccurred())
+
+		stringData, _, _ := unstructured.NestedMap(secret.Object, "stringData")
+		Expect(stringData[userDataSecretKey]).To(Equal("#cloud-config\npackages:\n  - vim"))
+
+		Expect(secret.GetLabels()[labels.ComputeInstanceUuid]).To(Equal(ciID))
+
+		ownerRefs := secret.GetOwnerReferences()
+		Expect(ownerRefs).To(HaveLen(1))
+		Expect(ownerRefs[0].Name).To(Equal(crName))
+		Expect(ownerRefs[0].UID).To(Equal(owner.GetUID()))
+		Expect(ownerRefs[0].Kind).To(Equal(gvks.ComputeInstance.Kind))
+	})
+
+	It("should be idempotent when Secret already exists", func() {
+		existingSecret := &unstructured.Unstructured{}
+		existingSecret.SetGroupVersionKind(gvks.Secret)
+		existingSecret.SetNamespace(hubNamespace)
+		existingSecret.SetName(ciID + userDataSecretSuffix)
+
+		scheme := runtime.NewScheme()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(existingSecret).
+			Build()
+
+		t := &task{
+			r: &function{logger: logger},
+			computeInstance: privatev1.ComputeInstance_builder{
+				Id: ciID,
+				Spec: privatev1.ComputeInstanceSpec_builder{
+					UserDataSecretRef: proto.String("some-data"),
+				}.Build(),
+			}.Build(),
+			hubNamespace:       hubNamespace,
+			hubClient:          fakeClient,
+			userDataSecretName: ciID + userDataSecretSuffix,
+		}
+
+		err := t.ensureUserDataSecret(ctx, owner)
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("should propagate error when Secret creation fails", func() {
+		scheme := runtime.NewScheme()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, client clnt.WithWatch, obj clnt.Object, opts ...clnt.CreateOption) error {
+					return errors.New("create failed")
+				},
+			}).
+			Build()
+
+		t := &task{
+			r: &function{logger: logger},
+			computeInstance: privatev1.ComputeInstance_builder{
+				Id: ciID,
+				Spec: privatev1.ComputeInstanceSpec_builder{
+					UserDataSecretRef: proto.String("some-data"),
+				}.Build(),
+			}.Build(),
+			hubNamespace:       hubNamespace,
+			hubClient:          fakeClient,
+			userDataSecretName: ciID + userDataSecretSuffix,
+		}
+
+		err := t.ensureUserDataSecret(ctx, owner)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("create failed"))
+	})
+
+	It("should not create a Secret when userDataSecretName is empty", func() {
+		scheme := runtime.NewScheme()
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(scheme).
+			Build()
+
+		t := &task{
+			r: &function{logger: logger},
+			computeInstance: privatev1.ComputeInstance_builder{
+				Id:   ciID,
+				Spec: privatev1.ComputeInstanceSpec_builder{}.Build(),
+			}.Build(),
+			hubNamespace: hubNamespace,
+			hubClient:    fakeClient,
+		}
+
+		err := t.ensureUserDataSecret(ctx, owner)
+		Expect(err).ToNot(HaveOccurred())
 	})
 })
