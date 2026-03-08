@@ -140,6 +140,10 @@ message VirtualNetworkStatus {
   //
   // For READY state, this is typically empty or contains confirmation like "Network ready for compute instances".
   optional string message = 2;
+
+  // Identifier of the hub that was selected for this virtual network.
+  // This is system-managed and used by the controller to track which hub cluster manages this network's resources.
+  string hub = 3;
 }
 
 // Lifecycle states for VirtualNetwork resources.
