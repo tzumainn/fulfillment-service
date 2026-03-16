@@ -31,8 +31,9 @@ import (
 
 var _ = Describe("Private subnets server", func() {
 	var (
-		ctx context.Context
-		tx  database.Tx
+		ctx       context.Context
+		tx        database.Tx
+		subnetDao *dao.GenericDAO[*privatev1.Subnet]
 	)
 
 	BeforeEach(func() {
@@ -66,6 +67,15 @@ var _ = Describe("Private subnets server", func() {
 
 		// Create the tables:
 		err = dao.CreateTables(ctx, "subnets", "virtual_networks", "network_classes")
+		Expect(err).ToNot(HaveOccurred())
+
+		// Create the subnet DAO:
+		subnetDao, err = dao.NewGenericDAO[*privatev1.Subnet]().
+			SetLogger(logger).
+			SetTable("subnets").
+			SetAttributionLogic(attribution).
+			SetTenancyLogic(tenancy).
+			Build()
 		Expect(err).ToNot(HaveOccurred())
 	})
 
@@ -684,15 +694,6 @@ var _ = Describe("Private subnets server", func() {
 			It("verifies ownerReference annotation is set after Create", func() {
 				vn := createVirtualNetwork(ctx, "10.0.0.0/16", "")
 
-				// Create Subnet DAO for Create operation
-				subnetDao, err := dao.NewGenericDAO[*privatev1.Subnet]().
-					SetLogger(logger).
-					SetTable("subnets").
-					SetAttributionLogic(attribution).
-					SetTenancyLogic(tenancy).
-					Build()
-				Expect(err).ToNot(HaveOccurred())
-
 				subnet := privatev1.Subnet_builder{
 					Spec: privatev1.SubnetSpec_builder{
 						Ipv4Cidr:       proto.String("10.0.1.0/24"),
@@ -701,7 +702,7 @@ var _ = Describe("Private subnets server", func() {
 				}.Build()
 
 				// Simulate what Create operation does (validation + annotation)
-				err = server.validateSubnet(ctx, subnet, nil)
+				err := server.validateSubnet(ctx, subnet, nil)
 				Expect(err).ToNot(HaveOccurred())
 
 				// Set owner reference annotation
@@ -777,19 +778,6 @@ var _ = Describe("Private subnets server", func() {
 		})
 
 		Context("CIDR overlap validation", func() {
-			var subnetDao *dao.GenericDAO[*privatev1.Subnet]
-
-			BeforeEach(func() {
-				var err error
-				subnetDao, err = dao.NewGenericDAO[*privatev1.Subnet]().
-					SetLogger(logger).
-					SetTable("subnets").
-					SetAttributionLogic(attribution).
-					SetTenancyLogic(tenancy).
-					Build()
-				Expect(err).ToNot(HaveOccurred())
-			})
-
 			// Helper to create a subnet directly in the database
 			createSubnetInDB := func(ctx context.Context, name, ipv4Cidr, ipv6Cidr, virtualNetworkID string) {
 				builder := privatev1.SubnetSpec_builder{
