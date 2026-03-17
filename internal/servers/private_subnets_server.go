@@ -16,6 +16,7 @@ package servers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 
@@ -336,7 +337,96 @@ func (s *PrivateSubnetsServer) validateVirtualNetworkReference(ctx context.Conte
 		}
 	}
 
+	// Validate no CIDR overlap with existing subnets in the same VirtualNetwork:
+	if err := s.validateNoCIDROverlap(ctx, spec); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// validateNoCIDROverlap checks that the new subnet's CIDRs don't overlap with any existing
+// subnets in the same VirtualNetwork.
+// Note: this check is not fully atomic; concurrent subnet creation could bypass overlap
+// validation. A locking mechanism would be needed for complete reliability.
+func (s *PrivateSubnetsServer) validateNoCIDROverlap(ctx context.Context,
+	spec *privatev1.SubnetSpec) error {
+
+	// Fetch all existing subnets for the same VirtualNetwork using pagination:
+	filter := fmt.Sprintf("this.spec.virtual_network == '%s'", spec.GetVirtualNetwork())
+	var allSubnets []*privatev1.Subnet
+	var offset int32
+	for {
+		listRequest := &privatev1.SubnetsListRequest{}
+		listRequest.SetFilter(filter)
+		listRequest.SetOffset(offset)
+		var listResponse *privatev1.SubnetsListResponse
+		if err := s.generic.List(ctx, listRequest, &listResponse); err != nil {
+			s.logger.ErrorContext(
+				ctx,
+				"Failed to list sibling subnets",
+				slog.String("virtual_network_id", spec.GetVirtualNetwork()),
+				slog.Any("error", err),
+			)
+			return grpcstatus.Errorf(grpccodes.Internal, "failed to validate CIDR overlap")
+		}
+		allSubnets = append(allSubnets, listResponse.GetItems()...)
+		if offset+listResponse.GetSize() >= listResponse.GetTotal() {
+			break
+		}
+		offset += listResponse.GetSize()
+	}
+
+	for _, existing := range allSubnets {
+		existingSpec := existing.GetSpec()
+
+		// Check IPv4 overlap:
+		if spec.HasIpv4Cidr() && existingSpec.HasIpv4Cidr() {
+			overlap, err := cidrsOverlap(spec.GetIpv4Cidr(), existingSpec.GetIpv4Cidr())
+			if err != nil {
+				return grpcstatus.Errorf(grpccodes.Internal,
+					"failed to parse CIDRs for overlap check: %v", err)
+			}
+			if overlap {
+				return grpcstatus.Errorf(grpccodes.AlreadyExists,
+					"subnet IPv4 CIDR '%s' overlaps with existing subnet '%s' (CIDR '%s') "+
+						"in VirtualNetwork '%s'",
+					spec.GetIpv4Cidr(), existing.GetMetadata().GetName(),
+					existingSpec.GetIpv4Cidr(), spec.GetVirtualNetwork())
+			}
+		}
+
+		// Check IPv6 overlap:
+		if spec.HasIpv6Cidr() && existingSpec.HasIpv6Cidr() {
+			overlap, err := cidrsOverlap(spec.GetIpv6Cidr(), existingSpec.GetIpv6Cidr())
+			if err != nil {
+				return grpcstatus.Errorf(grpccodes.Internal,
+					"failed to parse CIDRs for overlap check: %v", err)
+			}
+			if overlap {
+				return grpcstatus.Errorf(grpccodes.AlreadyExists,
+					"subnet IPv6 CIDR '%s' overlaps with existing subnet '%s' (CIDR '%s') "+
+						"in VirtualNetwork '%s'",
+					spec.GetIpv6Cidr(), existing.GetMetadata().GetName(),
+					existingSpec.GetIpv6Cidr(), spec.GetVirtualNetwork())
+			}
+		}
+	}
+
+	return nil
+}
+
+// cidrsOverlap returns true if two CIDRs overlap (one contains any part of the other).
+func cidrsOverlap(cidrA, cidrB string) (bool, error) {
+	_, netA, errA := net.ParseCIDR(cidrA)
+	_, netB, errB := net.ParseCIDR(cidrB)
+	if errA != nil || errB != nil {
+		return false, fmt.Errorf(
+			"failed to parse CIDRs: %q: %v, %q: %v",
+			cidrA, errA, cidrB, errB,
+		)
+	}
+	return netA.Contains(netB.IP) || netB.Contains(netA.IP), nil
 }
 
 // validateImmutableFieldsSubnet validates that immutable fields have not been changed.
