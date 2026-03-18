@@ -597,6 +597,19 @@ func (c *startGrpcServerCommandRunner) run(cmd *cobra.Command, argv []string) er
 	}
 	privatev1.RegisterHubsServer(grpcServer, privateHubsServer)
 
+	// Create the virtual networks server:
+	c.logger.InfoContext(ctx, "Creating virtual networks server")
+	virtualNetworksServer, err := servers.NewVirtualNetworksServer().
+		SetLogger(c.logger).
+		SetNotifier(notifier).
+		SetAttributionLogic(publicAttributionLogic).
+		SetTenancyLogic(publicTenancyLogic).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create virtual networks server: %w", err)
+	}
+	publicv1.RegisterVirtualNetworksServer(grpcServer, virtualNetworksServer)
+
 	// Create the private virtual networks server:
 	c.logger.InfoContext(ctx, "Creating private virtual networks server")
 	privateVirtualNetworksServer, err := servers.NewPrivateVirtualNetworksServer().
