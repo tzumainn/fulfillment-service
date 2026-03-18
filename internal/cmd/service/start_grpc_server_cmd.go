@@ -623,6 +623,19 @@ func (c *startGrpcServerCommandRunner) run(cmd *cobra.Command, argv []string) er
 	}
 	privatev1.RegisterSubnetsServer(grpcServer, privateSubnetsServer)
 
+	// Create the network classes server:
+	c.logger.InfoContext(ctx, "Creating network classes server")
+	networkClassesServer, err := servers.NewNetworkClassesServer().
+		SetLogger(c.logger).
+		SetNotifier(notifier).
+		SetAttributionLogic(publicAttributionLogic).
+		SetTenancyLogic(publicTenancyLogic).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create network classes server: %w", err)
+	}
+	publicv1.RegisterNetworkClassesServer(grpcServer, networkClassesServer)
+
 	// Create the private network classes server:
 	c.logger.InfoContext(ctx, "Creating private network classes server")
 	privateNetworkClassesServer, err := servers.NewPrivateNetworkClassesServer().
