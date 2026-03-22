@@ -40,6 +40,7 @@ import (
 	"github.com/osac-project/fulfillment-service/internal/controllers/computeinstance"
 	"github.com/osac-project/fulfillment-service/internal/controllers/host"
 	"github.com/osac-project/fulfillment-service/internal/controllers/hostpool"
+	"github.com/osac-project/fulfillment-service/internal/controllers/securitygroup"
 	"github.com/osac-project/fulfillment-service/internal/controllers/subnet"
 	"github.com/osac-project/fulfillment-service/internal/controllers/virtualnetwork"
 	internalhealth "github.com/osac-project/fulfillment-service/internal/health"
@@ -437,6 +438,43 @@ func (r *runnerContext) run(cmd *cobra.Command, argv []string) error {
 			r.logger.InfoContext(
 				ctx,
 				"Virtual network reconciler failed",
+				slog.Any("error", err),
+			)
+		}
+	}()
+
+	// Create the security group reconciler:
+	r.logger.InfoContext(ctx, "Creating security group reconciler")
+	securityGroupReconcilerFunction, err := securitygroup.NewFunction().
+		SetLogger(r.logger).
+		SetConnection(r.client).
+		SetHubCache(hubCache).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create security group reconciler function: %w", err)
+	}
+	securityGroupReconciler, err := controllers.NewReconciler[*privatev1.SecurityGroup]().
+		SetLogger(r.logger).
+		SetName("security_group").
+		SetClient(r.client).
+		SetFunction(securityGroupReconcilerFunction).
+		SetEventFilter("has(event.security_group) || (has(event.hub) && event.type == EVENT_TYPE_OBJECT_CREATED)").
+		SetHealthReporter(healthAggregator).
+		Build()
+	if err != nil {
+		return fmt.Errorf("failed to create security group reconciler: %w", err)
+	}
+
+	// Start the security group reconciler:
+	r.logger.InfoContext(ctx, "Starting security group reconciler")
+	go func() {
+		err := securityGroupReconciler.Start(ctx)
+		if err == nil || errors.Is(err, context.Canceled) {
+			r.logger.InfoContext(ctx, "Security group reconciler finished")
+		} else {
+			r.logger.InfoContext(
+				ctx,
+				"Security group reconciler failed",
 				slog.Any("error", err),
 			)
 		}
